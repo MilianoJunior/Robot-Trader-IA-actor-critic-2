@@ -4,14 +4,13 @@ Created on Thu Dec 17 14:19:05 2020
 
 @author: jrmfi
 """
-
+# Bibliotecas
 import base64
 import IPython
 import matplotlib.pyplot as plt
 import os
 import tempfile
 
-# import reverb
 import chardet
 import pandas as pd
 import tensorflow as tf
@@ -19,7 +18,6 @@ import tensorflow as tf
 from tf_agents.agents.ddpg import critic_network
 from tf_agents.agents.sac import sac_agent
 from tf_agents.agents.sac import tanh_normal_projection_network
-# from tf_agents.environments import suite_pybullet
 from tf_agents.experimental.train import actor
 from tf_agents.experimental.train import learner
 from tf_agents.experimental.train import triggers
@@ -33,6 +31,7 @@ from tf_agents.policies import py_tf_eager_policy
 from tf_agents.policies import random_py_policy
 from tf_agents.replay_buffers import reverb_replay_buffer
 from tf_agents.replay_buffers import reverb_utils
+from tf_agents.environments import tf_py_environment
 
 tempdir = tempfile.gettempdir()
 
@@ -40,6 +39,8 @@ tempdir = tempfile.gettempdir()
 from CardTrader import CardGameEnv
 
 tf.compat.v1.enable_v2_behavior()
+
+# importar os dados para o treinamento no ambiente
 
 " 1 passo: importar os dados"
 try:
@@ -51,13 +52,13 @@ try:
 except:
     print('Erro, é preciso fazer o download dos dados OHLC em csv')
 
-
+# Configuração dos hiperparametros
 num_day = 565
 # Use "num_iterations = 1e6" for better results (2 hrs)
 # 1e5 is just so this doesn't take too long (1 hr)
 num_iterations = 100000 # @param {type:"integer"}
 
-initial_collect_steps = 10000 # @param {type:"integer"}
+initial_collect_steps = 1000 # @param {type:"integer"}
 collect_steps_per_iteration = 1 # @param {type:"integer"}
 replay_buffer_capacity = 10000 # @param {type:"integer"}
 
@@ -81,20 +82,24 @@ eval_interval = 10000 # @param {type:"integer"}
 
 policy_save_interval = 5000 # @param {type:"integer"}
 
+
+# Instancia dos ambientes
 collect_env = CardGameEnv(base,num_day)
 eval_env = CardGameEnv(base,num_day)
 
-# train_env = tf_py_environment.TFPyEnvironment(train_py_env)
-# eval_env = tf_py_environment.TFPyEnvironment(eval_py_env)
+collect_env= tf_py_environment.TFPyEnvironment(collect_env)
+eval_env = tf_py_environment.TFPyEnvironment(eval_env)
 
+# Configuracao da estrategia e uso da gpu
 use_gpu = True
 
 strategy = strategy_utils.get_strategy(tpu=False, use_gpu=use_gpu)
 
+# definição das entradas e acoes para o autor e critico
 observation_spec, action_spec, time_step_spec = (
       spec_utils.get_tensor_specs(collect_env))
 
-
+# Configuração da rede neural - critic
 with strategy.scope():
   critic_net = critic_network.CriticNetwork(
         (observation_spec, action_spec),
@@ -103,7 +108,8 @@ with strategy.scope():
         joint_fc_layer_params=critic_joint_fc_layer_params,
         kernel_initializer='glorot_uniform',
         last_kernel_initializer='glorot_uniform')
-  
+
+# configuração da rede neural - actor
 with strategy.scope():
   actor_net = actor_distribution_network.ActorDistributionNetwork(
       observation_spec,
@@ -111,7 +117,8 @@ with strategy.scope():
       fc_layer_params=actor_fc_layer_params,
       continuous_projection_net=(
           tanh_normal_projection_network.TanhNormalProjectionNetwork))
-  
+
+# definição do agente
 with strategy.scope():
   train_step = train_utils.create_train_step()
 
@@ -134,5 +141,43 @@ with strategy.scope():
         train_step_counter=train_step)
 
   tf_agent.initialize()
+
+# Politica
+tf_eval_policy = tf_agent.policy
+eval_policy = py_tf_eager_policy.PyTFEagerPolicy(
+  tf_eval_policy, use_tf_function=True)
+
+tf_collect_policy = tf_agent.collect_policy
+collect_policy = py_tf_eager_policy.PyTFEagerPolicy(
+  tf_collect_policy, use_tf_function=True)
+
+random_policy = random_py_policy.RandomPyPolicy(
+  collect_env.time_step_spec(), collect_env.action_spec())
+
+from tf_agents.replay_buffers import tf_uniform_replay_buffer
+from tf_agents.trajectories import trajectory
+
+
+replay_buffer = tf_uniform_replay_buffer.TFUniformReplayBuffer(
+    data_spec=tf_agent.collect_data_spec,
+    batch_size=1,
+    max_length=replay_buffer_capacity)
+
+def collect_step(environment, policy):
+  time_step = environment.current_time_step()
+  action_step = policy.action(time_step)
+  next_time_step = environment.step(action_step.action)
+  traj = trajectory.from_transition(time_step, action_step, next_time_step)
+
+  # Add trajectory to the replay buffer
+  replay_buffer.add_batch(traj)
+
+
+for _ in range(initial_collect_steps):
+  collect_step(collect_env, tf_collect_policy)
   
-# rate_limiter=reverb.rate_limiters.SampleToInsertRatio(samples_per_insert=3.0, min_size_to_sample=3, error_buffer=3.0)
+dataset = replay_buffer.as_dataset(
+  num_parallel_calls=3, sample_batch_size=batch_size,
+  num_steps=2).prefetch(50)
+
+iterator = iter(dataset)
